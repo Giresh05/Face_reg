@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: face-recognition-server
+    env: python
+    plan: free # Or your preferred plan
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "gunicorn --worker-class gevent --bind 0.0.0.0:10000 --timeout 120 server:app"
+    healthCheckPath: /
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.9.9 # Or a version compatible with your TF version
+    disk:
+      name: models_and_embeddings
+      mountPath: /app/models # Mount point for your model
+      sizeGB: 1
+
+  - type: disk
+    name: models_and_embeddings
+    sizeGB: 1
+    # This disk will persist your model and saved embeddings
