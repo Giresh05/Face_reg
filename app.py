@@ -4,13 +4,18 @@ import numpy as np
 import tensorflow.compat.v1 as tf
 from flask import Flask, request, jsonify
 import logging
+import shutil
 
 # --- Configuration for Render Deployment ---
-# The /app/data directory will be a persistent disk on Render
+# This is the mount path of the persistent disk on Render.
 PERSISTENT_DATA_PATH = '/app/data'
 EMBEDDINGS_DIR = os.path.join(PERSISTENT_DATA_PATH, 'embeddings')
 MODEL_PATH = os.path.join(PERSISTENT_DATA_PATH, 'MobileFaceNet_9925_9680.pb')
-UPLOAD_FOLDER = 'uploads' # This can remain temporary
+
+# This is the path to the model file in your Git repository.
+LOCAL_MODEL_PATH_IN_REPO = 'MobileFaceNet_9925_9680.pb'
+
+UPLOAD_FOLDER = 'uploads' # This can remain a temporary folder
 
 # --- Model & Verification Configuration ---
 INPUT_NODE = 'img_inputs:0'
@@ -22,20 +27,38 @@ app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 logging.basicConfig(level=logging.INFO)
 
-# --- Create necessary directories on startup ---
-# This ensures the directories exist on the persistent disk
-if not os.path.exists(UPLOAD_FOLDER):
-    os.makedirs(UPLOAD_FOLDER)
-if not os.path.exists(EMBEDDINGS_DIR):
-    os.makedirs(EMBEDDINGS_DIR)
+# --- Prepare Persistent Storage on Startup ---
+def setup_persistent_storage():
+    """
+    Ensures necessary directories and files exist on the persistent disk.
+    If the model is not on the disk, it copies it from the repo.
+    """
+    # Create embeddings and upload directories if they don't exist
+    os.makedirs(EMBEDDINGS_DIR, exist_ok=True)
+    os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+    
+    # Check if the model exists on the persistent disk
+    if not os.path.exists(MODEL_PATH):
+        app.logger.info(f"Model not found on persistent disk at {MODEL_PATH}.")
+        # Check if the model exists in the local repo path
+        if os.path.exists(LOCAL_MODEL_PATH_IN_REPO):
+            app.logger.info(f"Found model in repository. Copying to persistent disk...")
+            try:
+                shutil.copy(LOCAL_MODEL_PATH_IN_REPO, PERSISTENT_DATA_PATH)
+                app.logger.info(f"Successfully copied model to {MODEL_PATH}.")
+            except Exception as e:
+                app.logger.error(f"Failed to copy model to persistent disk: {e}")
+        else:
+            app.logger.error(f"CRITICAL: Model file not found in repository at {LOCAL_MODEL_PATH_IN_REPO} or on disk.")
+
+setup_persistent_storage()
+
 
 # --- Load TensorFlow Graph ---
 def load_graph(frozen_graph_filename):
     """Loads a frozen TensorFlow model into memory."""
     if not os.path.exists(frozen_graph_filename):
-        # Log a critical error if the model file is not found
         app.logger.critical(f"FATAL ERROR: Model file not found at {frozen_graph_filename}")
-        # In a real-world scenario, you might want to exit or prevent the app from starting
         return None
     with tf.gfile.GFile(frozen_graph_filename, "rb") as f:
         graph_def = tf.GraphDef()
@@ -75,7 +98,6 @@ def health_check():
     Health check endpoint for Render.
     Render will call this path to ensure the service is alive.
     """
-    # Check if the model is loaded as a basic health indicator
     status = "OK" if sess else "Model not loaded"
     return jsonify({'status': status}), 200 if sess else 503
 
@@ -176,5 +198,5 @@ def verify_face():
 
 if __name__ == '__main__':
     # This block is for local development only.
-    # Gunicorn will be used in production as defined in render.yaml.
+    # Gunicorn will be used in production.
     app.run(host='0.0.0.0', port=5000, debug=True)
