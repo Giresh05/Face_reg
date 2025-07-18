@@ -1,104 +1,180 @@
-from flask import Flask, request, jsonify
-import numpy as np
-import cv2
-import tensorflow as tf
 import os
-import mediapipe as mp
+import cv2
+import numpy as np
+import tensorflow.compat.v1 as tf
+from flask import Flask, request, jsonify
+import logging
 
+# --- Configuration for Render Deployment ---
+# The /app/data directory will be a persistent disk on Render
+PERSISTENT_DATA_PATH = '/app/data'
+EMBEDDINGS_DIR = os.path.join(PERSISTENT_DATA_PATH, 'embeddings')
+MODEL_PATH = os.path.join(PERSISTENT_DATA_PATH, 'MobileFaceNet_9925_9680.pb')
+UPLOAD_FOLDER = 'uploads' # This can remain temporary
+
+# --- Model & Verification Configuration ---
+INPUT_NODE = 'img_inputs:0'
+OUTPUT_NODE = 'embeddings:0'
+VERIFICATION_THRESHOLD = 1.0  # L2 Distance threshold
+
+# --- Flask App Initialization ---
 app = Flask(__name__)
-ENROLL_PATH = "face_embeddings.npz"
-PB_MODEL_PATH = "model.pb"  # Your frozen .pb model
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+logging.basicConfig(level=logging.INFO)
 
-# ----------- Load PB Model -----------
-def load_graph():
-    graph = tf.Graph()
-    with tf.io.gfile.GFile(PB_MODEL_PATH, "rb") as f:
-        graph_def = tf.compat.v1.GraphDef()
+# --- Create necessary directories on startup ---
+# This ensures the directories exist on the persistent disk
+if not os.path.exists(UPLOAD_FOLDER):
+    os.makedirs(UPLOAD_FOLDER)
+if not os.path.exists(EMBEDDINGS_DIR):
+    os.makedirs(EMBEDDINGS_DIR)
+
+# --- Load TensorFlow Graph ---
+def load_graph(frozen_graph_filename):
+    """Loads a frozen TensorFlow model into memory."""
+    if not os.path.exists(frozen_graph_filename):
+        # Log a critical error if the model file is not found
+        app.logger.critical(f"FATAL ERROR: Model file not found at {frozen_graph_filename}")
+        # In a real-world scenario, you might want to exit or prevent the app from starting
+        return None
+    with tf.gfile.GFile(frozen_graph_filename, "rb") as f:
+        graph_def = tf.GraphDef()
         graph_def.ParseFromString(f.read())
-    with graph.as_default():
+
+    with tf.Graph().as_default() as graph:
         tf.import_graph_def(graph_def, name="")
     return graph
 
-graph = load_graph()
-sess = tf.compat.v1.Session(graph=graph)
+graph = load_graph(MODEL_PATH)
+# Only create a session if the graph was loaded successfully
+if graph:
+    sess = tf.Session(graph=graph)
+    image_tensor = graph.get_tensor_by_name(INPUT_NODE)
+    embedding_tensor = graph.get_tensor_by_name(OUTPUT_NODE)
+    app.logger.info("✅ TensorFlow model and session loaded.")
+else:
+    sess = None
+    app.logger.error("Could not initialize TensorFlow session because the model failed to load.")
 
-input_tensor = graph.get_tensor_by_name("input:0")          # CHANGE if yours is different
-output_tensor = graph.get_tensor_by_name("embeddings:0")    # CHANGE if yours is different
 
-# ----------- Mediapipe for Blink Detection -----------
-mp_face_mesh = mp.solutions.face_mesh
-face_mesh = mp_face_mesh.FaceMesh(static_image_mode=True)
-LEFT_EYE_IDX = [362, 385, 387, 263, 373, 380]
-RIGHT_EYE_IDX = [33, 160, 158, 133, 153, 144]
+def preprocess_image(image_bytes):
+    """Decodes and preprocesses the image for the model."""
+    nparr = np.frombuffer(image_bytes, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("Could not decode image. It might be corrupted or in an unsupported format.")
+    img = cv2.resize(img, (112, 112))
+    img = img.astype(np.float32) / 255.0
+    return np.expand_dims(img, axis=0)
 
-def calculate_ear(landmarks, left_ids, right_ids):
-    def eye_aspect_ratio(eye_points):
-        A = np.linalg.norm(eye_points[1] - eye_points[5])
-        B = np.linalg.norm(eye_points[2] - eye_points[4])
-        C = np.linalg.norm(eye_points[0] - eye_points[3])
-        return (A + B) / (2.0 * C)
+# --- API Endpoints ---
 
-    left_eye = np.array([landmarks[i] for i in left_ids])
-    right_eye = np.array([landmarks[i] for i in right_ids])
-    return (eye_aspect_ratio(left_eye) + eye_aspect_ratio(right_eye)) / 2.0
+@app.route('/')
+def health_check():
+    """
+    Health check endpoint for Render.
+    Render will call this path to ensure the service is alive.
+    """
+    # Check if the model is loaded as a basic health indicator
+    status = "OK" if sess else "Model not loaded"
+    return jsonify({'status': status}), 200 if sess else 503
 
-def extract_landmarks(image):
-    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    results = face_mesh.process(rgb)
-    if results.multi_face_landmarks:
-        return [(lm.x * image.shape[1], lm.y * image.shape[0]) for lm in results.multi_face_landmarks[0].landmark]
-    return None
-
-def detect_blink(images):
-    ears = []
-    for img in images:
-        landmarks = extract_landmarks(img)
-        if not landmarks:
-            continue
-        ear = calculate_ear(landmarks, LEFT_EYE_IDX, RIGHT_EYE_IDX)
-        ears.append(ear)
-    return min(ears) < 0.20 and (max(ears) - min(ears)) > 0.10
-
-# ----------- Embedding Extractor Using PB Model -----------
-def preprocess(img):
-    face = cv2.resize(img, (160, 160))   # Adjust if your model input size differs
-    face = face.astype(np.float32) / 255.0
-    return np.expand_dims(face, axis=0)
-
-def get_embedding(img):
-    face_input = preprocess(img)
-    embedding = sess.run(output_tensor, feed_dict={input_tensor: face_input})
-    return embedding[0]
-
-# ----------- Flask Routes -----------
 @app.route('/enroll', methods=['POST'])
-def enroll():
+def enroll_face():
+    """
+    Enrolls a face by saving its embedding.
+    Expects 'image' file and 'user_id' in the form data.
+    """
+    if not sess:
+        return jsonify({'error': 'Server is not ready, model not loaded.'}), 503
+
+    if 'image' not in request.files or 'user_id' not in request.form:
+        return jsonify({'error': 'Missing image or user_id'}), 400
+
     file = request.files['image']
-    img = cv2.imdecode(np.frombuffer(file.read(), np.uint8), cv2.IMREAD_COLOR)
-    embedding = get_embedding(img)
-    np.savez_compressed(ENROLL_PATH, embedding=embedding)
-    return jsonify({'status': 'Enrolled'})
+    user_id = request.form['user_id']
+    app.logger.info(f"--- Enrolling user: {user_id} ---")
+    
+    try:
+        image_data = preprocess_image(file.read())
+        embedding = sess.run(embedding_tensor, feed_dict={image_tensor: image_data})
+        
+        embedding_path = os.path.join(EMBEDDINGS_DIR, f'{user_id}.npz')
+        np.savez_compressed(embedding_path, embedding=embedding.flatten())
+        
+        app.logger.info(f"✅ User {user_id} enrolled successfully.")
+        return jsonify({'message': f'User {user_id} enrolled successfully.'}), 200
+    except Exception as e:
+        app.logger.error(f"Enrollment error for {user_id}: {e}", exc_info=True)
+        return jsonify({'error': f'An error occurred: {str(e)}'}), 500
 
 @app.route('/verify', methods=['POST'])
-def verify():
-    files = request.files.getlist('images')
-    images = [cv2.imdecode(np.frombuffer(file.read(), np.uint8), cv2.IMREAD_COLOR) for file in files]
+def verify_face():
+    """
+    Verifies a face against an enrolled embedding.
+    Expects 5 'image' files and 'user_id' in the form data.
+    """
+    if not sess:
+        return jsonify({'error': 'Server is not ready, model not loaded.'}), 503
 
-    if not detect_blink(images):
-        return jsonify({'status': 'Failed', 'reason': 'No blink detected'}), 403
+    if 'user_id' not in request.form:
+        return jsonify({'error': 'Missing user_id'}), 400
+        
+    user_id = request.form['user_id']
+    files = request.files.getlist('image')
+    app.logger.info(f"--- Verifying user: {user_id} with {len(files)} images ---")
+
+    if len(files) != 5:
+        return jsonify({'error': 'Please provide exactly 5 images for verification.'}), 400
+
+    enrolled_embedding_path = os.path.join(EMBEDDINGS_DIR, f'{user_id}.npz')
+    if not os.path.exists(enrolled_embedding_path):
+        return jsonify({'error': 'User not enrolled.'}), 404
 
     try:
-        data = np.load(ENROLL_PATH)
-        enrolled = data['embedding']
-    except:
-        return jsonify({'error': 'No enrolled face found'}), 400
+        enrolled_data = np.load(enrolled_embedding_path)
+        enrolled_embedding = enrolled_data['embedding']
+        app.logger.info(f"Loaded enrolled embedding for {user_id}. Shape: {enrolled_embedding.shape}")
 
-    test_embedding = get_embedding(images[0])  # Pick first image for verification
+        burst_embeddings = []
+        for file in files:
+            image_data = preprocess_image(file.read())
+            embedding = sess.run(embedding_tensor, feed_dict={image_tensor: image_data})
+            burst_embeddings.append(embedding.flatten())
 
-    # Cosine similarity
-    similarity = np.dot(enrolled, test_embedding) / (np.linalg.norm(enrolled) * np.linalg.norm(test_embedding))
-    status = 'Success' if similarity > 0.6 else 'Failed'
-    return jsonify({'status': status, 'similarity': float(similarity)})
+        app.logger.info("Successfully processed burst of 5 images.")
+
+        # --- Basic Liveness Check ---
+        is_live = False
+        for i in range(len(burst_embeddings) - 1):
+            if not np.array_equal(burst_embeddings[i], burst_embeddings[i+1]):
+                is_live = True
+                break
+        
+        if not is_live:
+             app.logger.warning(f"Liveness check failed for {user_id}.")
+             return jsonify({'verified': False, 'message': 'Liveness check failed (images are identical).'}), 200
+
+        # --- Verification Logic ---
+        avg_burst_embedding = np.mean(burst_embeddings, axis=0)
+        
+        distance = np.linalg.norm(enrolled_embedding - avg_burst_embedding)
+        
+        verified = distance < VERIFICATION_THRESHOLD
+        app.logger.info(f"Verification for {user_id}: Distance={distance:.4f}, Verified={verified}")
+
+        return jsonify({
+            'verified': bool(verified),
+            'distance': float(distance),
+            'threshold': VERIFICATION_THRESHOLD,
+            'liveness_check': 'Passed'
+        }), 200
+
+    except Exception as e:
+        app.logger.error(f"Verification error for {user_id}: {e}", exc_info=True)
+        return jsonify({'error': f'An error occurred: {str(e)}'}), 500
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    # This block is for local development only.
+    # Gunicorn will be used in production as defined in render.yaml.
+    app.run(host='0.0.0.0', port=5000, debug=True)
