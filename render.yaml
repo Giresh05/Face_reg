@@ -1,20 +1,32 @@
+# This file tells Render how to build and run your application.
 services:
+  # This section defines your web service (your Flask API).
   - type: web
-    name: face-recognition-server
+    name: face-recognition-api
     env: python
-    plan: free # Or your preferred plan
+    # The 'starter' plan is recommended over 'free' for better memory/CPU with TensorFlow.
+    plan: starter
+    # This command runs when you deploy, installing all packages from requirements.txt.
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "gunicorn --worker-class gevent --bind 0.0.0.0:10000 --timeout 120 server:app"
+    # This command starts your web server using Gunicorn for production.
+    # It points to the 'app' object inside your 'app.py' file.
+    startCommand: "gunicorn --timeout 120 --workers 2 --threads 2 --bind 0.0.0.0:10000 app:app"
+    # Render uses this path to check if your service is healthy.
     healthCheckPath: /
     envVars:
       - key: PYTHON_VERSION
-        value: 3.9.9 # Or a version compatible with your TF version
+        value: 3.8.13 # A stable Python version compatible with TensorFlow 1.x
+      - key: TF_CPP_MIN_LOG_LEVEL
+        value: "2" # Suppresses non-critical TensorFlow startup logs
+    # This links the persistent disk defined below to your web service.
     disk:
-      name: models_and_embeddings
-      mountPath: /app/models # Mount point for your model
+      # The name must match the disk service name below.
+      name: face-rec-data
+      # This mount path MUST exactly match the PERSISTENT_DATA_PATH in your Python script.
+      mountPath: /app/data
       sizeGB: 1
 
+  # This section defines the persistent disk itself.
   - type: disk
-    name: models_and_embeddings
+    name: face-rec-data
     sizeGB: 1
-    # This disk will persist your model and saved embeddings
