@@ -1,5 +1,6 @@
-Flask
-numpy
+flask
+tensorflow-cpu # Using the CPU version is often easier for deployment
 opencv-python-headless
-tensorflow==2.12.0
-scikit-learn
+numpy
+gunicorn # A production-ready web server
+requests
